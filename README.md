@@ -3,87 +3,107 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+import time
+import math
+from tf.transformations import euler_from_quaternion
 from my_robot_interfaces.srv import NextGoal
+from rclpy.qos import qos_profile_sensor_data
 
 class HBTask1BController(Node):
-
     def __init__(self):
         super().__init__('hb_task1b_controller')
 
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.odom_sub = self.create_subscription(Odometry, '/odom', self.odometry_callback, 10)
+        # Initialize Publisher and Subscriber
+        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.subscription = self.create_subscription(
+            Odometry, '/odom', self.odometry_callback, qos_profile=qos_profile_sensor_data)
 
+        # Initialize a Twist message
         self.vel = Twist()
-        self.rate = self.create_rate(100)
-        self.flag = 0
+        # Initialize the required variables to 0
+        self.hb_x = 0
+        self.hb_y = 0
+        self.hb_theta = 0
 
-        self.cli = self.create_client(NextGoal, 'next_goal')
-        self.req = NextGoal.Request()
+        # For maintaining control loop rate.
+        self.rate = self.create_rate(100)
+
+        # Define desired goal poses
+        self.x_goals = [4, -4, -4, 4, 0]
+        self.y_goals = [4, 4, -4, -4, 0]
+        self.theta_goals = [0, 0, 0, 0, 0]
+
+        # Initialize index to track the current goal pose
         self.index = 0
 
     def odometry_callback(self, msg):
-        if self.flag == 1:
-            self.flag = 0
-            self.req.request_goal += 1
-            self.send_request(self.req.request_goal)
+        # Extract the robot's pose information from the /odom topic
+        pose = msg.pose.pose
+        orientation = pose.orientation
+        orientation_list = [orientation.x, orientation.y, orientation.z, orientation.w]
+        (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+        self.hb_x = pose.position.x
+        self.hb_y = pose.position.y
+        self.hb_theta = yaw
 
-    def send_request(self, index):
-        self.req.request_goal = self.index
-        self.future = self.cli.call_async(self.req)
+    def main(self):
+        # Control loop
+        while rclpy.ok():
+            # Calculate error in global frame
+            x_error = self.x_goals[self.index] - self.hb_x
+            y_error = self.y_goals[self.index] - self.hb_y
+            theta_error = self.theta_goals[self.index] - self.hb_theta
+
+            # Calculate error in body frame
+            cos_theta = math.cos(self.hb_theta)
+            sin_theta = math.sin(self.hb_theta)
+            x_error_body = cos_theta * x_error + sin_theta * y_error
+            y_error_body = -sin_theta * x_error + cos_theta * y_error
+            theta_error_body = theta_error
+
+            # P controller gains (you may need to tune these)
+            Kp_x = 1.0
+            Kp_y = 1.0
+            Kp_theta = 1.0
+
+            # Calculate desired linear and angular velocities
+            v_x = Kp_x * x_error_body
+            v_y = Kp_y * y_error_body
+            w = Kp_theta * theta_error_body
+
+            # Safety checks for velocity limits (you may need to adjust these)
+            max_linear_velocity = 1.0
+            max_angular_velocity = 1.0
+            v_x = min(max(v_x, -max_linear_velocity), max_linear_velocity)
+            v_y = min(max(v_y, -max_linear_velocity), max_linear_velocity)
+            w = min(max(w, -max_angular_velocity), max_angular_velocity)
+
+            # Publish the desired velocities
+            self.vel.linear.x = v_x
+            self.vel.linear.y = v_y
+            self.vel.angular.z = w
+            self.publisher_.publish(self.vel)
+
+            # Check if the goal has been reached
+            if abs(x_error) < 0.1 and abs(y_error) < 0.1 and abs(theta_error) < 0.1:
+                # Stabilize at the goal pose for 1 second
+                time.sleep(1)
+                # Increment the index if it's less than the length of the goal pose lists
+                if self.index < len(self.x_goals) - 1:
+                    self.index += 1
+                else:
+                    # If all goal poses have been reached, you can break out of the loop
+                    break
+
+            self.rate.sleep()
+
+        self.destroy_node()
+        rclpy.shutdown()
 
 def main(args=None):
     rclpy.init(args=args)
-
     ebot_controller = HBTask1BController()
-    ebot_controller.send_request(ebot_controller.index)
-
-    while rclpy.ok():
-        if ebot_controller.future.done():
-            try:
-                response = ebot_controller.future.result()
-            except Exception as e:
-                ebot_controller.get_logger().info('Service call failed %r' % (e,))
-            else:
-                x_goal = response.x_goal
-                y_goal = response.y_goal
-                theta_goal = response.theta_goal
-                ebot_controller.flag = response.end_of_list
-
-                error_x_global = x_goal - ebot_controller.hb_x
-                error_y_global = y_goal - ebot_controller.hb_y
-                error_theta_global = theta_goal - ebot_controller.hb_theta
-
-                error_x_body = error_x_global * math.cos(ebot_controller.hb_theta) + error_y_global * math.sin(ebot_controller.hb_theta)
-                error_y_body = -error_x_global * math.sin(ebot_controller.hb_theta) + error_y_global * math.cos(ebot_controller.hb_theta)
-                error_theta_body = error_theta_global
-
-                v_x = ebot_controller.Kp_linear * error_x_body
-                v_y = ebot_controller.Kp_linear * error_y_body
-                w = ebot_controller.Kp_angular * error_theta_body
-
-                ebot_controller.vel.linear.x = v_x
-                ebot_controller.vel.linear.y = v_y
-                ebot_controller.vel.angular.z = w
-
-                ebot_controller.cmd_vel_pub.publish(ebot_controller.vel)
-
-                if abs(error_x_global) < 0.1 and abs(error_y_global) < 0.1 and abs(error_theta_global) < 0.1:
-                    ebot_controller.stable_time += 0.01
-                    if ebot_controller.stable_time >= 1.0:
-                        ebot_controller.stable_time = 0.0
-                        ebot_controller.index += 1
-                        if ebot_controller.index >= len(ebot_controller.x_goals):
-                            ebot_controller.index = 0
-                        ebot_controller.req.x_goal = ebot_controller.x_goals[ebot_controller.index]
-                        ebot_controller.req.y_goal = ebot_controller.y_goals[ebot_controller.index]
-                        ebot_controller.req.theta_goal = ebot_controller.theta_goals[ebot_controller.index]
-                        ebot_controller.future = ebot_controller.cli.call_async(ebot_controller.req)
-
-        rclpy.spin_once(ebot_controller)
-
-    ebot_controller.destroy_node()
-    rclpy.shutdown()
+    ebot_controller.main()
 
 if __name__ == '__main__':
     main()
-
